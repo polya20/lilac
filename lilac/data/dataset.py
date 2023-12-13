@@ -58,7 +58,7 @@ from ..signal import (
 )
 from ..signals.concept_scorer import ConceptSignal
 from ..source import Source, resolve_source
-from ..tasks import TaskExecutionType, TaskStepId
+from ..tasks import TaskExecutionType, TaskShardId
 from .dataset_format import DatasetFormat
 
 # Threshold for rejecting certain queries (e.g. group by) for columns with large cardinality.
@@ -436,7 +436,7 @@ class Dataset(abc.ABC):
     limit: Optional[int] = None,
     include_deleted: bool = False,
     overwrite: bool = False,
-    task_step_id: Optional[TaskStepId] = None,
+    task_shard_id: Optional[TaskShardId] = None,
   ) -> None:
     """Compute a signal for a column.
 
@@ -447,8 +447,8 @@ class Dataset(abc.ABC):
       limit: Limit the number of rows to compute the signal on.
       include_deleted: Whether to include deleted rows in the computation.
       overwrite: Whether to overwrite an existing signal computed at this path.
-      task_step_id: The TaskManager `task_step_id` for this process run. This is used to update the
-        progress of the task.
+      task_shard_id: The TaskManager `task_shard_id` for this process run. This is used to update
+        the progress of the task.
     """
     pass
 
@@ -460,11 +460,11 @@ class Dataset(abc.ABC):
     limit: Optional[int] = None,
     include_deleted: bool = False,
     overwrite: bool = False,
-    task_step_id: Optional[TaskStepId] = None,
+    task_shard_id: Optional[TaskShardId] = None,
   ) -> None:
     """Compute an embedding for a given field path."""
     signal = get_signal_by_type(embedding, TextEmbeddingSignal)()
-    self.compute_signal(signal, path, filters, limit, include_deleted, overwrite, task_step_id)
+    self.compute_signal(signal, path, filters, limit, include_deleted, overwrite, task_shard_id)
 
   def compute_concept(
     self,
@@ -476,12 +476,18 @@ class Dataset(abc.ABC):
     limit: Optional[int] = None,
     include_deleted: bool = False,
     overwrite: bool = False,
-    task_step_id: Optional[TaskStepId] = None,
+    task_shard_id: Optional[TaskShardId] = None,
   ) -> None:
     """Compute concept scores for a given field path."""
     signal = ConceptSignal(namespace=namespace, concept_name=concept_name, embedding=embedding)
     self.compute_signal(
-      signal, path, filters, limit, include_deleted, overwrite=overwrite, task_step_id=task_step_id
+      signal,
+      path,
+      filters,
+      limit,
+      include_deleted,
+      overwrite=overwrite,
+      task_shard_id=task_shard_id,
     )
 
   @abc.abstractmethod
@@ -529,7 +535,6 @@ class Dataset(abc.ABC):
     sort_order: Optional[SortOrder] = SortOrder.DESC,
     limit: Optional[int] = 100,
     offset: Optional[int] = 0,
-    task_step_id: Optional[TaskStepId] = None,
     resolve_span: bool = False,
     combine_columns: bool = False,
     include_deleted: bool = False,
@@ -553,8 +558,6 @@ class Dataset(abc.ABC):
       sort_order: The sort order.
       limit: The maximum number of rows to return.
       offset: The offset to start returning rows from.
-      task_step_id: The TaskManager `task_step_id` for this process run. This is used to update the
-        progress.
       resolve_span: Whether to resolve the span of the row.
       combine_columns: Whether to combine columns into a single object. The object will be pruned
         to only include sub-fields that correspond to the requested columns.

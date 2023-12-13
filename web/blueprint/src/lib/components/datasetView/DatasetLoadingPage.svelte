@@ -74,7 +74,10 @@
   const tasks = queryTaskManifest();
 
   $: task = loadingTaskId != null && $tasks.data != null ? $tasks.data.tasks[loadingTaskId] : null;
-  $: progressValue = task?.step_progress == null ? undefined : task.step_progress;
+  $: progressValue =
+    task?.total_progress != null && task?.total_len != null
+      ? task.total_progress / task.total_len
+      : undefined;
 
   const taskToProgressStatus: {[taskStatus: string]: ProgressBarProps['status']} = {
     pending: 'active',
@@ -124,7 +127,7 @@
           </div>
           <div class="text-sm text-gray-700">
             {#if $firstRow?.data?.total_num_rows != null}
-              {$firstRow?.data?.total_num_rows} rows loaded
+              {$firstRow?.data?.total_num_rows.toLocaleString()} rows loaded
             {/if}
           </div>
         {/if}

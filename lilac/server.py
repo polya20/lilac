@@ -6,10 +6,10 @@ import os
 import webbrowser
 from contextlib import asynccontextmanager
 from importlib import metadata
+from threading import Thread
 from typing import Annotated, Any, AsyncGenerator, Optional
 
 import uvicorn
-from distributed import get_client
 from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, ORJSONResponse
 from fastapi.routing import APIRoute
@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
+from uvicorn.config import Config
 
 from . import (
   router_concept,
@@ -40,7 +41,7 @@ from .load import load
 from .project import create_project_and_set_env
 from .router_utils import RouteErrorHandler
 from .source import registered_sources
-from .tasks import TaskManager, get_task_manager
+from .tasks import get_task_manager
 
 DIST_PATH = os.path.join(os.path.dirname(__file__), 'web')
 
@@ -57,26 +58,11 @@ def custom_generate_unique_id(route: APIRoute) -> str:
   return route.name
 
 
-def _load(load_task_id: str) -> None:
-  load(
-    project_dir=get_project_dir(),
-    overwrite=False,
-    task_manager=TaskManager(dask_client=get_client()),
-    load_task_id=load_task_id,
-  )
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
   """Context manager for the lifespan of the application."""
   if env('LILAC_LOAD_ON_START_SERVER', False):
-    task_manager = get_task_manager()
-    task_id = task_manager.task_id(
-      'Loading from project config... ',
-      description='This can be disabled by setting the environment variable '
-      'LILAC_LOAD_ON_START_SERVER=false',
-    )
-    task_manager.execute(task_id, 'processes', _load, task_id)
+    load(project_dir=get_project_dir(), overwrite=False, execution_type='processes')
 
   yield
 
@@ -161,11 +147,7 @@ def status() -> ServerStatus:
 @app.post('/load_config')
 def load_config(background_tasks: BackgroundTasks) -> dict:
   """Loads from the lilac.yml."""
-
-  async def _load() -> None:
-    load(project_dir=get_project_dir(), overwrite=False, task_manager=get_task_manager())
-
-  background_tasks.add_task(_load)
+  background_tasks.add_task(load, project_dir=get_project_dir(), overwrite=False)
   return {}
 
 
@@ -211,7 +193,30 @@ class GetTasksFilter(logging.Filter):
 
 logging.getLogger('uvicorn.access').addFilter(GetTasksFilter())
 
-SERVER: Optional[uvicorn.Server] = None
+
+class Server(uvicorn.Server):
+  """Server that runs in a separate thread."""
+
+  def __init__(self, config: Config) -> None:
+    super().__init__(config)
+
+    def run() -> None:
+      loop = asyncio.get_event_loop()
+      loop.run_until_complete(self.serve())
+
+    self.thread = Thread(target=run)
+
+  def start(self) -> None:
+    """Start the server in a separate thread."""
+    self.thread.start()
+
+  def stop(self) -> None:
+    """Stop the server."""
+    self.should_exit = True
+    self.thread.join()
+
+
+SERVER: Optional[Server] = None
 
 
 def start_server(
@@ -242,29 +247,21 @@ def start_server(
   if load:
     os.environ['LILAC_LOAD_ON_START_SERVER'] = 'true'
 
-  config = uvicorn.Config(app, host=host, port=port, access_log=False)
-  SERVER = uvicorn.Server(config)
-
   if open:
 
     @app.on_event('startup')
     def open_browser() -> None:
       webbrowser.open(f'http://{host}:{port}')
 
-  try:
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-      loop.create_task(SERVER.serve())
-    else:
-      SERVER.run()
-  except RuntimeError:
-    SERVER.run()
+  config = uvicorn.Config(app, host=host, port=port, access_log=False)
+  SERVER = Server(config)
+  SERVER.start()
 
 
-async def stop_server() -> None:
+def stop_server() -> None:
   """Stops the Lilac web server."""
   global SERVER
   if SERVER is None:
-    raise ValueError('Server is not running')
-  await SERVER.shutdown()
+    return
+  SERVER.stop()
   SERVER = None

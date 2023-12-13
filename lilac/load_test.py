@@ -6,13 +6,10 @@ from typing import ClassVar, Iterable, Optional, cast
 
 import numpy as np
 import pytest
-from distributed import Client
-from pytest_mock import MockerFixture
 from typing_extensions import override
 
 from .config import Config, DatasetConfig, EmbeddingConfig, SignalConfig
 from .data.dataset import DatasetManifest
-from .data.dataset_duckdb import DatasetDuckDB
 from .db_manager import get_dataset
 from .env import set_project_dir
 from .load import load
@@ -20,7 +17,6 @@ from .project import PROJECT_CONFIG_FILENAME, init
 from .schema import EMBEDDING_KEY, Field, Item, RichData, field, lilac_embedding, schema
 from .signal import TextEmbeddingSignal, TextSignal, clear_signal_registry, register_signal
 from .source import Source, SourceSchema, clear_source_registry, register_source
-from .tasks import TaskManager
 from .utils import to_yaml
 
 SIMPLE_ITEMS: list[Item] = [
@@ -36,11 +32,6 @@ EMBEDDINGS: list[tuple[str, list[float]]] = [
 ]
 
 STR_EMBEDDINGS: dict[str, list[float]] = {text: embedding for text, embedding in EMBEDDINGS}
-
-
-@pytest.fixture(scope='session')
-def task_manager() -> TaskManager:
-  return TaskManager(Client(processes=False))
 
 
 class TestSource(Source):
@@ -108,7 +99,7 @@ def setup_teardown() -> Iterable[None]:
   clear_signal_registry()
 
 
-def test_load_config_obj(tmp_path: pathlib.Path, task_manager: TaskManager) -> None:
+def test_load_config_obj(tmp_path: pathlib.Path) -> None:
   set_project_dir(tmp_path)
 
   # Initialize the lilac project. init() defaults to the project directory.
@@ -119,7 +110,7 @@ def test_load_config_obj(tmp_path: pathlib.Path, task_manager: TaskManager) -> N
   )
 
   # Load the project config from a config object.
-  load(config=project_config, task_manager=task_manager)
+  load(config=project_config, execution_type='threads')
 
   dataset = get_dataset('namespace', 'test')
 
@@ -132,7 +123,7 @@ def test_load_config_obj(tmp_path: pathlib.Path, task_manager: TaskManager) -> N
   )
 
 
-def test_load_project_config_yml(tmp_path: pathlib.Path, task_manager: TaskManager) -> None:
+def test_load_project_config_yml(tmp_path: pathlib.Path) -> None:
   set_project_dir(tmp_path)
 
   # Initialize the lilac project. init() defaults to the project directory.
@@ -149,7 +140,7 @@ def test_load_project_config_yml(tmp_path: pathlib.Path, task_manager: TaskManag
   with open(config_path, 'w') as f:
     f.write(project_config_yml)
 
-  load(config=config_path, task_manager=task_manager)
+  load(config=config_path, execution_type='threads')
 
   dataset = get_dataset('namespace', 'test')
 
@@ -162,7 +153,7 @@ def test_load_project_config_yml(tmp_path: pathlib.Path, task_manager: TaskManag
   )
 
 
-def test_load_config_yml_outside_project(tmp_path: pathlib.Path, task_manager: TaskManager) -> None:
+def test_load_config_yml_outside_project(tmp_path: pathlib.Path) -> None:
   # This test makes sure that we can load a yml file from outside the project directory.
 
   config_path = os.path.join(tmp_path, PROJECT_CONFIG_FILENAME)
@@ -180,7 +171,7 @@ def test_load_config_yml_outside_project(tmp_path: pathlib.Path, task_manager: T
   with open(config_path, 'w') as f:
     f.write(project_config_yml)
 
-  load(config=config_path, task_manager=task_manager)
+  load(config=config_path, execution_type='threads')
 
   dataset = get_dataset('namespace', 'test')
 
@@ -193,7 +184,7 @@ def test_load_config_yml_outside_project(tmp_path: pathlib.Path, task_manager: T
   )
 
 
-def test_load_signals(tmp_path: pathlib.Path, task_manager: TaskManager) -> None:
+def test_load_signals(tmp_path: pathlib.Path) -> None:
   set_project_dir(tmp_path)
 
   # Initialize the lilac project. init() defaults to the project directory.
@@ -212,7 +203,7 @@ def test_load_signals(tmp_path: pathlib.Path, task_manager: TaskManager) -> None
   )
 
   # Load the project config from a config object.
-  load(config=project_config, task_manager=task_manager)
+  load(config=project_config, execution_type='threads')
 
   dataset = get_dataset('namespace', 'test')
 
@@ -234,7 +225,7 @@ def test_load_signals(tmp_path: pathlib.Path, task_manager: TaskManager) -> None
   )
 
 
-def test_load_embeddings(tmp_path: pathlib.Path, task_manager: TaskManager) -> None:
+def test_load_embeddings(tmp_path: pathlib.Path) -> None:
   set_project_dir(tmp_path)
 
   # Initialize the lilac project. init() defaults to the project directory.
@@ -252,7 +243,7 @@ def test_load_embeddings(tmp_path: pathlib.Path, task_manager: TaskManager) -> N
   )
 
   # Load the project config from a config object.
-  load(config=project_config, task_manager=task_manager)
+  load(config=project_config, execution_type='threads')
 
   dataset = get_dataset('namespace', 'test')
 
@@ -280,16 +271,11 @@ def test_load_embeddings(tmp_path: pathlib.Path, task_manager: TaskManager) -> N
   )
 
 
-def test_load_twice_no_overwrite(
-  tmp_path: pathlib.Path, task_manager: TaskManager, mocker: MockerFixture
-) -> None:
+def test_load_twice_no_overwrite(tmp_path: pathlib.Path, capsys: pytest.CaptureFixture) -> None:
   set_project_dir(tmp_path)
 
   # Initialize the lilac project. init() defaults to the project directory.
   init()
-
-  compute_signal_mock = mocker.spy(DatasetDuckDB, DatasetDuckDB.compute_signal.__name__)
-  compute_embedding_mock = mocker.spy(DatasetDuckDB, DatasetDuckDB.compute_embedding.__name__)
 
   test_signal = TestSignal()
   project_config = Config(
@@ -305,34 +291,27 @@ def test_load_twice_no_overwrite(
   )
 
   # Load the project config from a config object.
-  load(config=project_config, task_manager=task_manager)
+  load(config=project_config, execution_type='threads')
 
-  assert compute_signal_mock.call_count == 1
-  assert compute_embedding_mock.call_count == 1
+  assert 'Computing signal' in capsys.readouterr().out
 
   first_manifest = get_dataset('namespace', 'test').manifest()
 
   # Load the project again, make sure signals and embeddings are not computed again.
-  load(config=project_config, task_manager=task_manager)
-
-  assert compute_signal_mock.call_count == 1
-  assert compute_embedding_mock.call_count == 1
+  load(config=project_config, execution_type='threads')
 
   second_manifest = get_dataset('namespace', 'test').manifest()
-
   assert first_manifest == second_manifest
+  assert (
+    'Signal  TestSignal({"signal_name":"test_signal"}) already exists' in capsys.readouterr().out
+  )
 
 
-def test_load_twice_overwrite(
-  tmp_path: pathlib.Path, task_manager: TaskManager, mocker: MockerFixture
-) -> None:
+def test_load_twice_overwrite(tmp_path: pathlib.Path, capsys: pytest.CaptureFixture) -> None:
   set_project_dir(tmp_path)
 
   # Initialize the lilac project. init() defaults to the project directory.
   init()
-
-  compute_signal_mock = mocker.spy(DatasetDuckDB, DatasetDuckDB.compute_signal.__name__)
-  compute_embedding_mock = mocker.spy(DatasetDuckDB, DatasetDuckDB.compute_embedding.__name__)
 
   test_signal = TestSignal()
   project_config = Config(
@@ -348,19 +327,18 @@ def test_load_twice_overwrite(
   )
 
   # Load the project config from a config object.
-  load(config=project_config, task_manager=task_manager)
-
-  assert compute_signal_mock.call_count == 1
-  assert compute_embedding_mock.call_count == 1
+  load(config=project_config, execution_type='threads')
+  assert 'Computing signal' in capsys.readouterr().out
 
   first_manifest = get_dataset('namespace', 'test').manifest()
 
   # Load the project again, make sure signals and embeddings are not computed again.
-  load(config=project_config, task_manager=task_manager, overwrite=True)
+  load(config=project_config, overwrite=True, execution_type='threads')
 
-  # With overwrite=True, compute_signal and compute_embedding should be called again.
-  assert compute_signal_mock.call_count == 2
-  assert compute_embedding_mock.call_count == 2
+  assert (
+    'Signal  TestSignal({"signal_name":"test_signal"}) already exists'
+    not in capsys.readouterr().out
+  )
 
   second_manifest = get_dataset('namespace', 'test').manifest()
 

@@ -13,9 +13,6 @@ import pathlib
 import shutil
 from typing import Optional, Union
 
-import psutil
-from distributed import Client
-
 from .concepts.db_concept import DiskConceptDB, DiskConceptModelDB
 from .config import Config, EmbeddingConfig, SignalConfig, read_config
 from .data.dataset_duckdb import DatasetDuckDB
@@ -25,12 +22,10 @@ from .load_dataset import process_source
 from .project import PROJECT_CONFIG_FILENAME
 from .schema import ROWID, PathTuple
 from .tasks import (
-  TaskManager,
-  TaskStepId,
-  TaskStepInfo,
+  TaskExecutionType,
+  TaskShardId,
   TaskType,
-  set_worker_next_step,
-  set_worker_steps,
+  get_task_manager,
 )
 from .utils import DebugTimer, get_datasets_dir, log
 
@@ -39,8 +34,7 @@ def load(
   project_dir: Optional[Union[str, pathlib.Path]] = None,
   config: Optional[Union[str, pathlib.Path, Config]] = None,
   overwrite: bool = False,
-  task_manager: Optional[TaskManager] = None,
-  load_task_id: Optional[str] = None,
+  execution_type: TaskExecutionType = 'processes',
 ) -> None:
   """Load a project from a project configuration.
 
@@ -53,9 +47,7 @@ def load(
       uses `LILAC_PROJECT_DIR`/lilac.yml.
     overwrite: When True, runs all data from scratch, overwriting existing data. When false, only
       load new datasets, embeddings, and signals.
-    task_manager: The task manager to use. If not defined, creates a new task manager.
-    load_task_id: The load task id if load is called from a task, which happens during server
-      bootup.
+    execution_type: The execution type for the task manager. Can be 'processes' or 'threads'.
   """
   project_dir = project_dir or get_project_dir()
   if not project_dir:
@@ -67,35 +59,17 @@ def load(
   # Turn off debug logging.
   if 'DEBUG' in os.environ:
     del os.environ['DEBUG']
-  # Use views to avoid loading duckdb tables into RAM since we aren't query heavy.
-  os.environ['DUCKDB_USE_VIEWS'] = '1'
 
   if not isinstance(config, Config):
     config_path = config or os.path.join(project_dir, PROJECT_CONFIG_FILENAME)
     config = read_config(config_path)
 
-  # Use threads instead of processes to avoid running out of RAM.
-  if not task_manager:
-    # Explicitly create a dask client in sync mode.
-    total_memory_gb = psutil.virtual_memory().total / (1024**3) * 2 / 3
-    task_manager = TaskManager(Client(memory_limit=f'{total_memory_gb} GB', processes=False))
+  task_manager = get_task_manager()
 
   if overwrite:
     shutil.rmtree(get_datasets_dir(project_dir), ignore_errors=True)
 
   existing_datasets = [f'{d.namespace}/{d.dataset_name}' for d in list_datasets(project_dir)]
-
-  if load_task_id:
-    set_worker_steps(
-      load_task_id,
-      [
-        TaskStepInfo(description='Loading datasets...'),
-        TaskStepInfo(description='Updating dataset settings...'),
-        TaskStepInfo(description='Computing embeddings...'),
-        TaskStepInfo(description='Computing signals...'),
-        TaskStepInfo(description='Computing model caches...'),
-      ],
-    )
 
   log()
   log('*** Load datasets ***')
@@ -117,7 +91,7 @@ def load(
       task_id = task_manager.task_id(
         f'Load dataset {d.namespace}/{d.name}', type=TaskType.DATASET_LOAD
       )
-      task_manager.execute(task_id, 'processes', process_source, project_dir, d, (task_id, 0))
+      task_manager.execute(task_id, execution_type, process_source, project_dir, d, (task_id, 0))
       dataset_task_ids.append(task_id)
     task_manager.wait(dataset_task_ids)
 
@@ -134,8 +108,6 @@ def load(
     total_num_rows += num_rows
 
   log(f'Done loading {len(datasets_to_load)} datasets with {total_num_rows:,} rows.')
-  if load_task_id:
-    set_worker_next_step(load_task_id)
 
   log('*** Dataset settings ***')
   for d in config.datasets:
@@ -143,9 +115,6 @@ def load(
       dataset = DatasetDuckDB(d.namespace, d.name, project_dir=project_dir)
       dataset.update_settings(d.settings)
       del dataset
-
-  if load_task_id:
-    set_worker_next_step(load_task_id)
 
   log()
   log('*** Compute embeddings ***')
@@ -173,7 +142,7 @@ def load(
           task_id = task_manager.task_id(f'Compute embedding {e.embedding} on {d.name}:{e.path}')
           task_manager.execute(
             task_id,
-            'processes',
+            execution_type,
             _compute_embedding,
             d.namespace,
             d.name,
@@ -190,9 +159,6 @@ def load(
 
       # Wait for all embeddings for each dataset to reduce the memory pressure.
       task_manager.wait(embedding_task_ids)
-
-  if load_task_id:
-    set_worker_next_step(load_task_id)
 
   log()
   log('*** Compute signals ***')
@@ -224,7 +190,7 @@ def load(
             task_id = task_manager.task_id(f'Compute signal {s.signal} on {d.name}:{s.path}')
             task_manager.execute(
               task_id,
-              'processes',
+              execution_type,
               _compute_signal,
               d.namespace,
               d.name,
@@ -241,9 +207,6 @@ def load(
       del dataset
       gc.collect()
 
-  if load_task_id:
-    set_worker_next_step(load_task_id)
-
   log()
   log('*** Compute model caches ***')
   with DebugTimer('Computing model caches'):
@@ -257,9 +220,6 @@ def load(
             concept_info.namespace, concept_info.name, embedding_name=embedding, create=True
           )
 
-  if load_task_id:
-    set_worker_next_step(load_task_id)
-
   log()
   log('Done!')
 
@@ -269,11 +229,9 @@ def _compute_signal(
   name: str,
   signal_config: SignalConfig,
   project_dir: Union[str, pathlib.Path],
-  task_step_id: TaskStepId,
+  task_shard_id: TaskShardId,
   overwrite: bool = False,
 ) -> None:
-  os.environ['DUCKDB_USE_VIEWS'] = '1'
-
   # Turn off debug logging.
   if 'DEBUG' in os.environ:
     del os.environ['DEBUG']
@@ -283,7 +241,7 @@ def _compute_signal(
     signal=signal_config.signal,
     path=signal_config.path,
     overwrite=overwrite,
-    task_step_id=task_step_id,
+    task_shard_id=task_shard_id,
   )
 
   # Free up RAM.
@@ -297,10 +255,8 @@ def _compute_embedding(
   name: str,
   embedding_config: EmbeddingConfig,
   project_dir: str,
-  task_step_id: TaskStepId,
+  task_shard_id: TaskShardId,
 ) -> None:
-  os.environ['DUCKDB_USE_VIEWS'] = '1'
-
   # Turn off debug logging.
   if 'DEBUG' in os.environ:
     del os.environ['DEBUG']
@@ -310,7 +266,7 @@ def _compute_embedding(
     embedding=embedding_config.embedding,
     path=embedding_config.path,
     overwrite=True,
-    task_step_id=task_step_id,
+    task_shard_id=task_shard_id,
   )
   remove_dataset_from_cache(namespace, name)
   del dataset

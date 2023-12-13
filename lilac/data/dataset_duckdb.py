@@ -95,12 +95,11 @@ from ..source import NoSource, SourceManifest
 from ..tasks import (
   TaskExecutionType,
   TaskFn,
-  TaskStepId,
+  TaskShardId,
   TaskType,
-  get_is_dask_worker,
   get_task_manager,
   report_progress,
-  show_progress,
+  show_progress_and_block,
 )
 from ..utils import (
   DebugTimer,
@@ -504,17 +503,8 @@ class DatasetDuckDB(Dataset):
       [SOURCE_VIEW_NAME]
       + [f'LEFT JOIN {escape_col_name(parquet_id)} USING ({ROWID})' for parquet_id in parquet_ids]
     )
-    view_or_table = 'TABLE'
-    # When in a dask worker, always use views to reduce memory overhead.
-    if get_is_dask_worker():
-      use_views = True
-    else:
-      use_views = bool(env('DUCKDB_USE_VIEWS', 0) or 0)
-
-    if use_views:
-      view_or_table = 'VIEW'
     sql_cmd = f"""
-      CREATE OR REPLACE {view_or_table} t AS (SELECT {select_sql} FROM {join_sql})
+      CREATE OR REPLACE VIEW t AS (SELECT {select_sql} FROM {join_sql})
     """
     self.con.execute(sql_cmd)
     # Get the total size of the table.
@@ -784,8 +774,7 @@ class DatasetDuckDB(Dataset):
     resolve_span: bool = False,
     shard_id: Optional[int] = None,
     shard_count: Optional[int] = None,
-    task_step_id: Optional[TaskStepId] = None,
-    task_step_description: Optional[str] = None,
+    task_shard_id: Optional[TaskShardId] = None,
   ) -> Iterable[Item]:
     manifest = self.manifest()
 
@@ -875,7 +864,7 @@ class DatasetDuckDB(Dataset):
     )
 
     # Add progress.
-    if task_step_id is not None:
+    if task_shard_id is not None:
       estimated_len = manifest.num_items
       # When sharding, compute the length of the work for the shard.
       (shard_start_idx, shard_end_idx) = shard_id_to_range(
@@ -885,12 +874,10 @@ class DatasetDuckDB(Dataset):
 
       output_items = report_progress(
         output_items,
-        task_step_id=task_step_id,
-        initial_id=start_idx,
-        shard_id=shard_id,
+        task_shard_id=task_shard_id,
         shard_count=shard_count,
+        initial_index=start_idx,
         estimated_len=estimated_len,
-        step_description=task_step_description,
       )
 
     output_items, jsonl_cache_items = itertools.tee(output_items, 2)
@@ -901,6 +888,7 @@ class DatasetDuckDB(Dataset):
           for item in output_items:
             json.dump(item, file)
             file.write('\n')
+            file.flush()
     except RuntimeError as e:
       # NOTE: A RuntimeError exception is thrown when the output_items iterator, which is a zip of
       # input and output items, yields a StopIterator exception.
@@ -992,11 +980,11 @@ class DatasetDuckDB(Dataset):
     limit: Optional[int] = None,
     include_deleted: bool = False,
     overwrite: bool = False,
-    task_step_id: Optional[TaskStepId] = None,
+    task_shard_id: Optional[TaskShardId] = None,
   ) -> None:
     if isinstance(signal, TextEmbeddingSignal):
       return self.compute_embedding(
-        signal.name, path, overwrite=overwrite, task_step_id=task_step_id
+        signal.name, path, overwrite=overwrite, task_shard_id=task_shard_id
       )
 
     input_path = normalize_path(path)
@@ -1014,9 +1002,9 @@ class DatasetDuckDB(Dataset):
     if manifest.data_schema.has_field(output_path) and not overwrite:
       raise ValueError('Signal already exists. Use overwrite=True to overwrite.')
 
-    if task_step_id is None:
+    if task_shard_id is None:
       # Make a dummy task step so we report progress via tqdm.
-      task_step_id = ('', 0)
+      task_shard_id = ('', 0)
 
     # Update the project config before computing the signal.
     add_project_signal_config(
@@ -1043,8 +1031,7 @@ class DatasetDuckDB(Dataset):
       query_options=DuckDBQueryParams(
         filters=filters, limit=limit, include_deleted=include_deleted
       ),
-      task_step_id=task_step_id,
-      task_step_description=f'Computing signal {signal} over {input_path}',
+      task_shard_id=task_shard_id,
     )
 
     signal_schema = create_signal_schema(signal, input_path, manifest.data_schema)
@@ -1089,7 +1076,7 @@ class DatasetDuckDB(Dataset):
     limit: Optional[int] = None,
     include_deleted: bool = False,
     overwrite: bool = False,
-    task_step_id: Optional[TaskStepId] = None,
+    task_shard_id: Optional[TaskShardId] = None,
   ) -> None:
     input_path = normalize_path(path)
     add_project_embedding_config(
@@ -1105,9 +1092,9 @@ class DatasetDuckDB(Dataset):
       raise ValueError('Cannot compute embedding over a non-string field.')
 
     filters, _ = self._normalize_filters(filters, col_aliases={}, udf_aliases={}, manifest=manifest)
-    if task_step_id is None:
+    if task_shard_id is None:
       # Make a dummy task step so we report progress via tqdm.
-      task_step_id = ('', 0)
+      task_shard_id = ('', 0)
 
     signal = get_signal_by_type(embedding, TextEmbeddingSignal)()
 
@@ -1132,8 +1119,7 @@ class DatasetDuckDB(Dataset):
       query_options=DuckDBQueryParams(
         filters=filters, limit=limit, include_deleted=include_deleted
       ),
-      task_step_id=task_step_id,
-      task_step_description=f'Computing embedding {signal} over {input_path}',
+      task_shard_id=task_shard_id,
     )
 
     output_dir = os.path.join(self.dataset_path, _signal_dir(output_path))
@@ -1661,7 +1647,6 @@ class DatasetDuckDB(Dataset):
     sort_order: Optional[SortOrder] = SortOrder.DESC,
     limit: Optional[int] = None,
     offset: Optional[int] = 0,
-    task_step_id: Optional[TaskStepId] = None,
     resolve_span: bool = False,
     combine_columns: bool = False,
     include_deleted: bool = False,
@@ -1921,8 +1906,6 @@ class DatasetDuckDB(Dataset):
       with DebugTimer(f'Computing signal "{signal.name}" on {path_id}'):
         signal.setup()
 
-        step_description = f'Computing {signal.key()} on {path_id}'
-
         if isinstance(signal, VectorSignal):
           embedding_signal = signal
           vector_store = self._get_vector_db_index(embedding_signal.embedding, udf_col.path)
@@ -1930,14 +1913,6 @@ class DatasetDuckDB(Dataset):
           signal_out = sparse_to_dense_compute(
             iter(flat_keys), lambda keys: embedding_signal.vector_compute(keys, vector_store)
           )
-          # Add progress.
-          if task_step_id is not None:
-            signal_out = report_progress(
-              signal_out,
-              task_step_id=task_step_id,
-              estimated_len=len(flat_keys),
-              step_description=step_description,
-            )
           df[signal_column] = list(deep_unflatten(signal_out, input))
         else:
           num_rich_data = count_primitives(input)
@@ -1945,14 +1920,6 @@ class DatasetDuckDB(Dataset):
           signal_out = sparse_to_dense_compute(
             flat_input, lambda x: signal.compute(cast(Iterable[RichData], x))
           )
-          # Add progress.
-          if task_step_id is not None:
-            signal_out = report_progress(
-              signal_out,
-              task_step_id=task_step_id,
-              estimated_len=num_rich_data,
-              step_description=step_description,
-            )
           signal_out_list = list(signal_out)
           if signal_column in temp_column_to_offset_column:
             offset_column_name, field = temp_column_to_offset_column[signal_column]
@@ -2098,7 +2065,6 @@ class DatasetDuckDB(Dataset):
     value: Optional[str] = 'true',
   ) -> int:
     created = datetime.now()
-
     # If filters and searches are defined with row_ids, add this as a filter.
     if row_ids:
       filters = list(filters) if filters else []
@@ -2638,7 +2604,6 @@ class DatasetDuckDB(Dataset):
     execution_type: TaskExecutionType = 'threads',
   ) -> Iterable[Item]:
     is_tmp_output = output_column is None
-
     manifest = self.manifest()
 
     input_path = normalize_path(input_path) if input_path else None
@@ -2704,7 +2669,7 @@ class DatasetDuckDB(Dataset):
       filter_likes=filters, col_aliases={}, udf_aliases={}, manifest=self.manifest()
     )
 
-    num_jobs = get_task_manager().get_num_workers() if num_jobs == -1 else num_jobs
+    num_jobs = (os.cpu_count() or 1) if num_jobs == -1 else num_jobs
 
     jsonl_cache_filepaths: list[str] = []
 
@@ -2729,7 +2694,6 @@ class DatasetDuckDB(Dataset):
         shard_id=i,
         shard_count=num_jobs,
       )
-      entire_input = False
       subtasks.append(
         (
           self._map_worker,
@@ -2745,8 +2709,7 @@ class DatasetDuckDB(Dataset):
             DuckDBQueryParams(filters=filters, limit=limit, include_deleted=include_deleted),
             combine_columns,
             resolve_span,
-            (task_id, 0),
-            progress_description,
+            (task_id, i),
           ],
         )
       )
@@ -2759,11 +2722,9 @@ class DatasetDuckDB(Dataset):
       type=execution_type,
       subtasks=subtasks,
     )
-    show_progress(
-      task_step_id=(task_id, 0), total_len=manifest.num_items, description=progress_description
-    )
+    show_progress_and_block(task_id, description=progress_description)
 
-    # Wait for the tasks to finish before reading the outputs.
+    # Wait for the task to finish before re-sharding the outputs.
     get_task_manager().wait([task_id])
 
     json_query, map_schema, parquet_filepath = self._reshard_cache(
@@ -2829,8 +2790,7 @@ class DatasetDuckDB(Dataset):
     query_options: Optional[DuckDBQueryParams] = None,
     combine_columns: bool = False,
     resolve_span: bool = False,
-    task_step_id: Optional[TaskStepId] = None,
-    task_step_description: Optional[str] = None,
+    task_shard_id: Optional[TaskShardId] = None,
   ) -> None:
     map_sig = inspect.signature(map_fn)
     if len(map_sig.parameters) > 2 or len(map_sig.parameters) == 0:
@@ -2872,8 +2832,7 @@ class DatasetDuckDB(Dataset):
       resolve_span=resolve_span,
       shard_id=job_id,
       shard_count=job_count,
-      task_step_id=task_step_id,
-      task_step_description=task_step_description,
+      task_shard_id=task_shard_id,
     )
 
   @override

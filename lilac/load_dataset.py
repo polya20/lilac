@@ -23,7 +23,7 @@ from .project import add_project_dataset_config, update_project_dataset_settings
 from .schema import MANIFEST_FILENAME, PARQUET_FILENAME_PREFIX, ROWID, Field, Item, Schema, is_float
 from .source import Source, SourceManifest
 from .sources.dict_source import DictSource
-from .tasks import TaskStepId, report_progress
+from .tasks import TaskId, report_progress
 from .utils import get_dataset_output_dir, log, open_file
 
 
@@ -46,7 +46,6 @@ def create_dataset(
       '`project_dir` must be defined. Please pass a `project_dir` or set it '
       'globally with `set_project_dir(path)`'
     )
-
   add_project_dataset_config(config, project_dir, overwrite)
 
   process_source(project_dir, config)
@@ -69,16 +68,16 @@ def from_dicts(
 def process_source(
   project_dir: Union[str, pathlib.Path],
   config: DatasetConfig,
-  task_step_id: Optional[TaskStepId] = None,
+  task_id: Optional[TaskId] = None,
 ) -> str:
   """Process a source."""
   output_dir = get_dataset_output_dir(project_dir, config.namespace, config.name)
 
   config.source.setup()
   try:
-    manifest = config.source.load_to_parquet(output_dir, task_step_id=task_step_id)
+    manifest = config.source.load_to_parquet(output_dir, task_id=task_id)
   except NotImplementedError:
-    manifest = slow_process(config.source, output_dir, task_step_id=task_step_id)
+    manifest = slow_process(config.source, output_dir, task_id=task_id)
 
   with open_file(os.path.join(output_dir, MANIFEST_FILENAME), 'w') as f:
     f.write(manifest.model_dump_json(indent=2, exclude_none=True))
@@ -94,15 +93,14 @@ def process_source(
 
 
 def slow_process(
-  source: Source, output_dir: str, task_step_id: Optional[TaskStepId] = None
+  source: Source, output_dir: str, task_id: Optional[TaskId] = None
 ) -> SourceManifest:
   """Process the items of a source, writing to parquet.
 
   Args:
     source: The source to process.
     output_dir: The directory to write the parquet files to.
-    task_step_id: The TaskManager `task_step_id` for this process run. This is used to update the
-      progress of the task.
+    task_id: The TaskManager id for this process run. This is used to update the task progress.
 
   Returns:
     A SourceManifest that describes schema and parquet file locations.
@@ -114,11 +112,11 @@ def slow_process(
   items = normalize_items(items, source_schema.fields)
 
   # Add progress.
+  task_shard_id = (task_id, 0) if task_id else None
   items = report_progress(
     items,
-    task_step_id=task_step_id,
+    task_shard_id=task_shard_id,
     estimated_len=source_schema.num_items,
-    step_description=f'Reading from source {source.name}...',
   )
 
   # Filter out the `None`s after progress.
