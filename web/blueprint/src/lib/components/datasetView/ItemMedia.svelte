@@ -26,7 +26,6 @@
     type LilacValueNode,
     type Path
   } from '$lilac';
-  import {SkeletonText} from 'carbon-components-svelte';
   import {
     CatalogPublish,
     ChevronDown,
@@ -65,7 +64,7 @@
   }
 
   $: valueNodes = row != null ? getValueNodes(row, rootPath!) : [];
-  $: isLeaf = valueNodes.length <= 1;
+  $: isLeaf = pathIsMatching(mediaPath, rootPath);
 
   // Get the list of next root paths for children of a repeated node.
   $: nextRootPaths = valueNodes.map(v => {
@@ -95,7 +94,7 @@
   $: displayPath = getDisplayPath(pathForDisplay);
 
   $: valueNode = valueNodes[0];
-  $: value = L.value(valueNode);
+  $: value = L.value(valueNode) as string;
   $: settings = querySettings($datasetViewStore.namespace, $datasetViewStore.datasetName);
 
   // Get slots for the view. These are custom UI renderings that are a function of dataset formats.
@@ -284,11 +283,11 @@
       {/if}
 
       <div class="grow pt-1">
-        {#if row != null}
+        {#if row != null && value != null}
           {#if colCompareState == null}
             <ItemMediaTextContent
               hidden={markdown}
-              text={formatValue(value)}
+              text={value}
               {row}
               path={rootPath}
               {field}
@@ -314,7 +313,7 @@
             />
           {/if}
         {:else}
-          <SkeletonText lines={3} paragraph class="w-full" />
+          <span class="ml-12 italic">null</span>
         {/if}
       </div>
     </div>
@@ -322,7 +321,7 @@
     <!-- Repeated values will render <ItemMedia> again. -->
     <div class="my-2 flex w-full flex-col rounded border border-neutral-200">
       <div class="m-2 flex flex-col gap-y-2">
-        <div title={displayPath} class="mx-2 mt-2 truncate font-mono font-medium text-neutral-500">
+        <div title={displayPath} class="mx-2 my-2 truncate font-mono font-medium text-neutral-500">
           {displayPath}
         </div>
         {#each nextRootPaths as nextRootPath}
