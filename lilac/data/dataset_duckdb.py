@@ -257,16 +257,17 @@ class MapManifest(BaseModel):
 class DuckDBMapOutput:
   """The output of a map computation."""
 
-  def __init__(self, con: duckdb.DuckDBPyConnection, query: str, output_column: str):
+  def __init__(self, con: duckdb.DuckDBPyConnection, query: str, output_path: PathTuple):
     self.con = con
     self.query = query
-    self.output_column = output_column
+    self.output_path = output_path
 
   def __iter__(self) -> Iterator[Item]:
     cursor = self.con.cursor()
     pyarrow_reader = cursor.execute(self.query).fetch_record_batch(rows_per_batch=10_000)
     for batch in pyarrow_reader:
-      yield from (row[self.output_column] for row in batch.to_pylist())
+      for row in batch.to_pylist():
+        yield row['value']
 
     pyarrow_reader.close()
 
@@ -899,7 +900,7 @@ class DatasetDuckDB(Dataset):
             yield item
       else:
         yield from output_items
-    except RuntimeError as e:
+    except RuntimeError:
       # NOTE: A RuntimeError exception is thrown when the output_items iterator, which is a zip of
       # input and output items, yields a StopIterator exception.
       raise ValueError(
@@ -912,6 +913,7 @@ class DatasetDuckDB(Dataset):
 
   def _reshard_cache(
     self,
+    manifest: DatasetManifest,
     output_path: PathTuple,
     jsonl_cache_filepaths: list[str],
     schema: Optional[Schema] = None,
@@ -939,16 +941,21 @@ class DatasetDuckDB(Dataset):
     # bug, interrupted it, updated and reran.
     #
     # Anyway this seems like a lot of unusual things have to happen so I'll leave the bug unfixed.
-    json_query = f"""
-      SELECT * FROM {'read_json' if schema else 'read_json_auto'}(
-        {jsonl_cache_filepaths},
-        {f'columns={duckdb_schema(schema)},' if schema else ''}
-        hive_partitioning=false,
-        ignore_errors=true,
-        format='newline_delimited'
-      )
-    """
-    con.execute(f'CREATE OR REPLACE VIEW "{jsonl_view_name}" as ({json_query});')
+
+    def get_json_query(selection: str) -> str:
+      if selection != '*':
+        selection += ' AS value'
+      return f"""
+        SELECT {selection} FROM {'read_json' if schema else 'read_json_auto'}(
+          {jsonl_cache_filepaths},
+          {f'columns={duckdb_schema(schema)},' if schema else ''}
+          hive_partitioning=false,
+          ignore_errors=true,
+          format='newline_delimited'
+        )
+      """
+
+    con.execute(f'CREATE OR REPLACE VIEW "{jsonl_view_name}" as ({get_json_query("*")});')
 
     parquet_filepath: Optional[str] = None
     reader = con.execute(f'SELECT * from {jsonl_view_name}').fetch_record_batch(
@@ -978,7 +985,10 @@ class DatasetDuckDB(Dataset):
     if ROWID in output_schema.fields:
       del output_schema.fields[ROWID]
 
-    return json_query, output_schema, parquet_filepath
+    select_str = _select_sql(
+      output_path, flatten=False, unnest=False, path=output_path, schema=manifest.data_schema
+    )
+    return get_json_query(select_str), output_schema, parquet_filepath
 
   @override
   def get_embeddings(
@@ -1063,6 +1073,7 @@ class DatasetDuckDB(Dataset):
     signal_schema = create_signal_schema(signal, input_path, manifest.data_schema)
 
     _, inferred_schema, parquet_filepath = self._reshard_cache(
+      manifest=manifest,
       output_path=output_path,
       schema=signal_schema,
       jsonl_cache_filepaths=[jsonl_cache_filepath],
@@ -1738,10 +1749,6 @@ class DatasetDuckDB(Dataset):
     # Add search where queries.
     for search in searches:
       search_path = normalize_path(search.path)
-      duckdb_path = self._leaf_path_to_duckdb_path(search_path, manifest.data_schema)
-      select_str = _select_sql(
-        duckdb_path, flatten=False, unnest=False, path=search_path, schema=manifest.data_schema
-      )
       if search.type == 'keyword':
         filters.append(Filter(path=search_path, op='ilike', value=search.query))
       elif search.type == 'semantic' or search.type == 'concept':
@@ -2632,8 +2639,7 @@ class DatasetDuckDB(Dataset):
     self,
     map_fn: MapFn,
     input_path: Optional[Path] = None,
-    output_column: Optional[str] = None,
-    nest_under: Optional[Path] = None,
+    output_path: Optional[Path] = None,
     overwrite: bool = False,
     combine_columns: bool = False,
     resolve_span: bool = False,
@@ -2646,35 +2652,31 @@ class DatasetDuckDB(Dataset):
     num_jobs: int = 1,
     execution_type: TaskExecutionType = 'threads',
   ) -> Iterable[Item]:
-    is_tmp_output = output_column is None
+    is_tmp_output = output_path is None
     manifest = self.manifest()
 
     input_path = normalize_path(input_path) if input_path else None
     if input_path and not manifest.data_schema.has_field(input_path):
       raise ValueError(f'Input path {input_path} does not exist in the dataset.')
 
-    # Validate output_column and nest_under.
-    if nest_under is not None:
-      nest_under = normalize_path(nest_under)
-      if output_column is None:
-        raise ValueError('When using `nest_under`, you must specify an output column name.')
+    # Validate output_path.
+    if output_path is not None:
+      output_path = normalize_path(output_path)
+      output_parent = output_path[:-1]
+      if output_parent:
+        if not manifest.data_schema.has_field(output_parent):
+          raise ValueError(f'Invalid output path. The parent {output_parent} does not exist.')
 
-      if not manifest.data_schema.has_field(nest_under):
-        raise ValueError(f'The `nest_under` column {nest_under} does not exist.')
+        assert paths_have_same_cardinality(
+          input_path or tuple(), output_parent
+        ), (
+          f'`input_path` {input_path} and `output_path` {output_path} have different cardinalities.'
+        )
 
-      assert paths_have_same_cardinality(
-        input_path or tuple(), nest_under
-      ), f'`input_path` {input_path} and `nest_under` {nest_under} have different cardinalities.'
-
-    # If the user didn't provide an output_column, we make a temporary one so that we can store the
+    # If the user didn't provide an output_path, we make a temporary one so that we can store the
     # output JSON objects in the cache, represented in the right hierarchy.
-    if output_column is None:
-      output_column = cast(str, getattr(map_fn, 'name', None)) or map_fn.__name__
-
-    if nest_under is not None:
-      output_path = (*nest_under, output_column)
-    else:
-      output_path = (output_column,)
+    if output_path is None:
+      output_path = (cast(str, getattr(map_fn, 'name', None)) or map_fn.__name__,)
 
     parquet_filepath: Optional[str] = None
     if not is_tmp_output:
@@ -2684,16 +2686,14 @@ class DatasetDuckDB(Dataset):
           if field.map is None:
             raise ValueError(f'{output_path} is not a map column so it cannot be overwritten.')
           # Delete the parquet file and map manifest.
-          assert output_column is not None
+          prefix = '.'.join(output_path)
           parquet_filepath = os.path.join(
-            self.dataset_path, get_parquet_filename(output_column, shard_index=0, num_shards=1)
+            self.dataset_path, get_parquet_filename(prefix, shard_index=0, num_shards=1)
           )
           if os.path.exists(parquet_filepath):
             delete_file(parquet_filepath)
 
-          map_manifest_filepath = os.path.join(
-            self.dataset_path, f'{output_column}.{MAP_MANIFEST_SUFFIX}'
-          )
+          map_manifest_filepath = os.path.join(self.dataset_path, f'{prefix}.{MAP_MANIFEST_SUFFIX}')
           if os.path.exists(map_manifest_filepath):
             delete_file(map_manifest_filepath)
         else:
@@ -2709,7 +2709,7 @@ class DatasetDuckDB(Dataset):
 
     jsonl_cache_filepaths: list[str] = []
 
-    output_col_desc_suffix = f' to "{output_column}"' if output_column else ''
+    output_col_desc_suffix = f' to "{output_path}"' if output_path else ''
     progress_description = (
       f'[{self.namespace}/{self.dataset_name}][{num_jobs} shards] map '
       f'"{map_fn.__name__}"{output_col_desc_suffix}'
@@ -2771,12 +2771,13 @@ class DatasetDuckDB(Dataset):
     get_task_manager().wait([task_id])
 
     json_query, map_schema, parquet_filepath = self._reshard_cache(
+      manifest=manifest,
       output_path=output_path,
       jsonl_cache_filepaths=jsonl_cache_filepaths,
       is_tmp_output=is_tmp_output,
     )
 
-    result = DuckDBMapOutput(con=self.con, query=json_query, output_column=output_column)
+    result = DuckDBMapOutput(con=self.con, query=json_query, output_path=output_path)
 
     if is_tmp_output:
       return result
@@ -2798,7 +2799,8 @@ class DatasetDuckDB(Dataset):
     )
 
     parquet_dir = os.path.dirname(parquet_filepath)
-    map_manifest_filepath = os.path.join(parquet_dir, f'{output_column}.{MAP_MANIFEST_SUFFIX}')
+    prefix = '.'.join(output_path)
+    map_manifest_filepath = os.path.join(parquet_dir, f'{prefix}.{MAP_MANIFEST_SUFFIX}')
     parquet_filename = os.path.basename(parquet_filepath)
     map_manifest = MapManifest(
       files=[parquet_filename],
@@ -2886,16 +2888,13 @@ class DatasetDuckDB(Dataset):
     self,
     path: Path,
     embedding: Optional[str] = None,
-    output_column: str = 'topic',
-    nest_under: Optional[Path] = None,
+    output_path: Optional[Path] = None,
     min_cluster_size: int = 5,
     topic_fn: Optional[TopicFn] = None,
     overwrite: bool = False,
   ) -> None:
     topic_fn = topic_fn or summarize_instructions
-    return cluster(
-      self, path, embedding, output_column, nest_under, min_cluster_size, topic_fn, overwrite
-    )
+    return cluster(self, path, embedding, output_path, min_cluster_size, topic_fn, overwrite)
 
   @override
   def to_json(
