@@ -83,7 +83,14 @@ from ..schema import (
   signal_type_supports_dtype,
 )
 from ..schema_duckdb import duckdb_schema, escape_col_name, escape_string_literal
-from ..signal import Signal, TextEmbeddingSignal, VectorSignal, get_signal_by_type, resolve_signal
+from ..signal import (
+  Signal,
+  TextEmbeddingSignal,
+  TopicFn,
+  VectorSignal,
+  get_signal_by_type,
+  resolve_signal,
+)
 from ..signals.concept_labels import ConceptLabelsSignal
 from ..signals.concept_scorer import ConceptSignal
 from ..signals.filter_mask import FilterMaskSignal
@@ -109,6 +116,7 @@ from ..utils import (
   open_file,
 )
 from . import dataset
+from .clustering import cluster, summarize_instructions
 from .dataset import (
   BINARY_OPS,
   DELETED_LABEL_NAME,
@@ -680,13 +688,15 @@ class DatasetDuckDB(Dataset):
 
     # Create a view for the work of the shard before anti-joining.
     t_shard_table = f't_shard_{shard_id}'
+
+    order_by_rowid = '' if query_options and query_options.sort_by else f'ORDER BY {ROWID}'
     con.execute(
       f"""
       CREATE OR REPLACE VIEW {t_shard_table} as (
         SELECT * FROM (
           SELECT * FROM t {options_clause}
         )
-        ORDER BY {ROWID}
+        {order_by_rowid}
         LIMIT {shard_end_idx - shard_start_idx}
         OFFSET {shard_start_idx}
       );
@@ -835,21 +845,21 @@ class DatasetDuckDB(Dataset):
         inputs_1, inputs_2 = itertools.tee(inputs_1, 2)
         vector_store = self._get_vector_db_index(embedding_signal.embedding, source_path)
         flat_keys = flatten_keys((rowid for (rowid, _) in inputs_2), input_values_0)
-        dense_out = sparse_to_dense_compute(
+        sparse_out = sparse_to_dense_compute(
           flat_keys, lambda keys: embedding_signal.vector_compute(keys, vector_store)
         )
       elif isinstance(transform_fn, Signal):
         signal = transform_fn
         flat_input = cast(Iterator[Optional[RichData]], flatten_iter(input_values_0, flatten_depth))
-        dense_out = sparse_to_dense_compute(
+        sparse_out = sparse_to_dense_compute(
           flat_input, lambda x: signal.compute(cast(Iterable[RichData], x))
         )
       else:
         map_fn = transform_fn
         assert not isinstance(map_fn, Signal)
         flat_input = cast(Iterator[Optional[RichData]], flatten_iter(input_values_0, flatten_depth))
-        dense_out = sparse_to_dense_compute(flat_input, lambda x: map_fn(x))
-      output_items = unflatten_iter(dense_out, input_values_1, flatten_depth)
+        sparse_out = sparse_to_dense_compute(flat_input, lambda x: map_fn(x))
+      output_items = unflatten_iter(sparse_out, input_values_1, flatten_depth)
     else:
       assert not isinstance(transform_fn, Signal)
       output_items = transform_fn(input_values)
@@ -2688,7 +2698,7 @@ class DatasetDuckDB(Dataset):
             delete_file(map_manifest_filepath)
         else:
           raise ValueError(
-            f'Cannot map to path "{output_column}" which already exists in the dataset. '
+            f'Cannot map to path "{output_path}" which already exists in the dataset. '
             'Use overwrite=True to overwrite the column.'
           )
     filters, _ = self._normalize_filters(
@@ -2838,7 +2848,8 @@ class DatasetDuckDB(Dataset):
       batch_stream: Iterable[Any]
       map_args: Union[Iterable[Any], tuple[Iterable[Any], int]]
       if batch_size == -1:
-        batch_stream = [list(items)]
+        yield from (map_fn(items, job_id) if has_job_id_arg else map_fn(items))
+        return
       elif batch_size is not None:
         batch_stream = map(list, chunks(items, batch_size))
       else:
@@ -2868,6 +2879,22 @@ class DatasetDuckDB(Dataset):
         shard_count=job_count,
         task_shard_id=task_shard_id,
       )
+    )
+
+  @override
+  def cluster(
+    self,
+    path: Path,
+    embedding: Optional[str] = None,
+    output_column: str = 'topic',
+    nest_under: Optional[Path] = None,
+    min_cluster_size: int = 5,
+    topic_fn: Optional[TopicFn] = None,
+    overwrite: bool = False,
+  ) -> None:
+    topic_fn = topic_fn or summarize_instructions
+    return cluster(
+      self, path, embedding, output_column, nest_under, min_cluster_size, topic_fn, overwrite
     )
 
   @override
