@@ -145,7 +145,7 @@ def test_map_signal(
   dataset.compute_signal(signal, 'text')
 
   def _map_fn(item: Item) -> Item:
-    return {'result': f'{item["text.test_signal.firstchar"]}_{len(item["text"])}'}
+    return {'result': f'{item["text"]["test_signal"]["firstchar"]}_{len(item["text"][VALUE_KEY])}'}
 
   # Write the output to a new column.
   dataset.map(_map_fn, output_path='output_text', num_jobs=num_jobs, execution_type=execution_type)
@@ -612,9 +612,7 @@ def test_map_overwrite(
   assert rows == [{'text': 'a', 'map_text': '0a'}, {'text': 'b', 'map_text': '0b'}]
 
   with pytest.raises(ValueError, match=' which already exists in the dataset'):
-    dataset.map(
-      _map_fn, output_path='map_text', combine_columns=False, execution_type=execution_type
-    )
+    dataset.map(_map_fn, output_path='map_text', execution_type=execution_type)
 
   prefix = '1'
   # Overwrite the output
@@ -734,12 +732,12 @@ def test_map_chained(make_test_data: TestDataMaker) -> None:
   def _split_fn(item: Item) -> Item:
     return item['text'].split(' ')
 
-  dataset.map(_split_fn, output_path='splits', combine_columns=False)
+  dataset.map(_split_fn, output_path='splits')
 
   def _rearrange_fn(item: Item) -> Item:
     return item['splits'][1] + ' ' + item['splits'][0]
 
-  dataset.map(_rearrange_fn, output_path='rearrange', combine_columns=False)
+  dataset.map(_rearrange_fn, output_path='rearrange')
 
   rows = list(dataset.select_rows([PATH_WILDCARD]))
   assert rows == [
@@ -774,18 +772,17 @@ def test_map_chained(make_test_data: TestDataMaker) -> None:
   )
 
 
-def test_map_combine_columns(make_test_data: TestDataMaker) -> None:
+def test_map_over_enriched_item(make_test_data: TestDataMaker) -> None:
   dataset = make_test_data([{'text': 'a sentence'}, {'text': 'b sentence'}])
 
   signal = TestFirstCharSignal()
   dataset.compute_signal(signal, 'text')
 
   def _map_fn(item: Item) -> Item:
-    # We use the combine_columns=True input here.
     return {'result': f'{item["text"]["test_signal"]["firstchar"]}_{len(item["text"][VALUE_KEY])}'}
 
   # Write the output to a new column.
-  dataset.map(_map_fn, output_path='output_text', combine_columns=True)
+  dataset.map(_map_fn, output_path='output_text')
 
   assert dataset.manifest() == DatasetManifest(
     namespace=TEST_NAMESPACE,
@@ -811,38 +808,6 @@ def test_map_combine_columns(make_test_data: TestDataMaker) -> None:
     num_items=2,
     source=TestSource(),
   )
-
-  rows = list(dataset.select_rows([PATH_WILDCARD]))
-  assert rows == [
-    {
-      'text': 'a sentence',
-      'text.test_signal.firstchar': 'a',
-      'text.test_signal.len': 10,
-      'output_text.result': 'a_10',
-    },
-    {
-      'text': 'b sentence',
-      'text.test_signal.firstchar': 'b',
-      'text.test_signal.len': 10,
-      'output_text.result': 'b_10',
-    },
-  ]
-
-
-def test_map_combine_columns_with_input_path(make_test_data: TestDataMaker) -> None:
-  dataset = make_test_data([{'text': 'a sentence'}, {'text': 'b sentence'}])
-
-  signal = TestFirstCharSignal()
-  dataset.compute_signal(signal, 'text')
-
-  def _map_fn(enriched_text: Item) -> Item:
-    # We use the combine_columns=True input here.
-    return {
-      'result': f'{enriched_text["test_signal"]["firstchar"]}_{len(enriched_text[VALUE_KEY])}'
-    }
-
-  # Write the output to a new column.
-  dataset.map(_map_fn, 'text', output_path='output_text', combine_columns=True)
 
   rows = list(dataset.select_rows([PATH_WILDCARD]))
   assert rows == [
@@ -915,12 +880,8 @@ def test_map_select_subfields_of_repeated_dicts(make_test_data: TestDataMaker) -
   dataset.map(lambda x: len(x), 'people.*.phones', output_path='len_phones')
   dataset.map(lambda x: x - 1, 'people.*.phones.*', output_path='phones_minus_one')
 
-  # No input path and combine columns is True.
-  dataset.map(
-    lambda x: 'people' in x and 'name' in x['people'][0],
-    output_path='has_name',
-    combine_columns=True,
-  )
+  # No input path.
+  dataset.map(lambda x: 'people' in x and 'name' in x['people'][0], output_path='has_name')
 
   rows = list(
     dataset.select_rows(
@@ -1085,7 +1046,7 @@ def test_signal_on_map_output(make_test_data: TestDataMaker) -> None:
   def _map_fn(item: Item) -> Item:
     return item['text'] + ' ' + item['text']
 
-  dataset.map(_map_fn, output_path='double', combine_columns=False)
+  dataset.map(_map_fn, output_path='double')
 
   # Compute a signal on the map output.
   signal = TestFirstCharSignal()
@@ -1157,7 +1118,7 @@ def test_map_nested_output_path(make_test_data: TestDataMaker) -> None:
   dataset = make_test_data([{'parent': {'text': 'a'}}, {'parent': {'text': 'abc'}}])
 
   def _map_fn(item: Item) -> Item:
-    return {'value': len(item['parent.text'])}
+    return {'value': len(item['parent']['text'])}
 
   dataset.map(_map_fn, output_path='parent.text.len')
 
@@ -1327,7 +1288,7 @@ def test_map_nested_output_another_cardinality_fails(make_test_data: TestDataMak
       "`input_path` None and `output_path` ('parent', '*', 'output') have different cardinalities"
     ),
   ):
-    dataset.map(_map_fn, output_path='parent.*.output', combine_columns=False)
+    dataset.map(_map_fn, output_path='parent.*.output')
 
 
 def test_map_with_span_resolving(make_test_data: TestDataMaker) -> None:

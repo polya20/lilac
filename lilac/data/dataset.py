@@ -710,7 +710,6 @@ class Dataset(abc.ABC):
     input_path: Optional[Path] = None,
     output_path: Optional[Path] = None,
     overwrite: bool = False,
-    combine_columns: bool = False,
     resolve_span: bool = False,
     batch_size: Optional[int] = None,
     filters: Optional[Sequence[FilterLike]] = None,
@@ -720,6 +719,8 @@ class Dataset(abc.ABC):
     include_deleted: bool = False,
     num_jobs: int = 1,
     execution_type: TaskExecutionType = 'threads',
+    embedding: Optional[str] = None,
+    schema: Optional[Field] = None,
   ) -> Iterable[Item]:
     """Maps a function over all rows in the dataset and writes the result to a new column.
 
@@ -734,9 +735,6 @@ class Dataset(abc.ABC):
         next to the input, so they will get hierarchically shown in the UI.
       overwrite: Set to true to overwrite this column if it already exists. If this bit is False,
         an error will be thrown if the column already exists.
-      combine_columns: When true, the row passed to the map function will be a deeply nested object
-        reflecting the hierarchy of the data. When false, all columns will be flattened as top-level
-        fields.
       resolve_span: Whether to resolve the spans into text before calling the map function.
       batch_size: If provided, the map function will be called with a list of rows. Useful for
         batching API requests or other expensive operations. If unspecified, the map will receive
@@ -756,6 +754,11 @@ class Dataset(abc.ABC):
       execution_type: The local execution type of the map. Either "threads" or "processes". Threads
         are better for network bound tasks like making requests to an external server, while
         processes are better for CPU bound tasks, like running a local LLM.
+      embedding: If specified, the map function will be called with the `lilac.SpanVector`s
+        of each item, instead of the original text. This is needed for embedding-based computations
+        (e.g. clustering).
+      schema: The schema for the output of the map function. If not provided, the schema will be
+        auto inferred.
 
     Returns:
       An iterable of items that are the result of map. The result item does not have the column name
@@ -769,12 +772,13 @@ class Dataset(abc.ABC):
     input_path: Optional[Path] = None,
     output_path: Optional[Path] = None,
     overwrite: bool = False,
-    combine_columns: bool = False,
     resolve_span: bool = False,
     filters: Optional[Sequence[FilterLike]] = None,
     limit: Optional[int] = None,
     sort_by: Optional[Path] = None,
     sort_order: Optional[SortOrder] = SortOrder.ASC,
+    embedding: Optional[str] = None,
+    schema: Optional[Field] = None,
   ) -> Iterable[Item]:
     """Transforms the entire dataset (or a column) and writes the result to a new column.
 
@@ -789,9 +793,6 @@ class Dataset(abc.ABC):
         next to the input, so they will get hierarchically shown in the UI.
       overwrite: Set to true to overwrite this column if it already exists. If this bit is False,
         an error will be thrown if the column already exists.
-      combine_columns: When true, the row passed to the map function will be a deeply nested object
-        reflecting the hierarchy of the data. When false, all columns will be flattened as top-level
-        fields.
       resolve_span: Whether to resolve the spans into text before calling the map function.
       filters: Filters limiting the set of rows to map over. At the moment, we do not support
         incremental computations; the output column will be null for rows that do not match the
@@ -801,13 +802,17 @@ class Dataset(abc.ABC):
       sort_by: The path to sort by. If specified, the map will be called with rows sorted by this
         path. This is useful for map functions that need to maintain state across rows.
       sort_order: The sort order. Defaults to ascending.
+      embedding: If specified, the transform function will be called with the `lilac.SpanVector`s
+        of each item, instead of the original text. This is needed for embedding-based computations
+        (e.g. clustering).
+      schema: The schema for the output of the map function. If not provided, the schema will be
+        auto inferred.
     """
     return self.map(
       map_fn=transform_fn,
       input_path=input_path,
       output_path=output_path,
       overwrite=overwrite,
-      combine_columns=combine_columns,
       resolve_span=resolve_span,
       batch_size=-1,
       filters=filters,
@@ -816,6 +821,8 @@ class Dataset(abc.ABC):
       sort_order=sort_order,
       num_jobs=1,
       execution_type='threads',
+      embedding=embedding,
+      schema=schema,
     )
 
   @abc.abstractmethod
