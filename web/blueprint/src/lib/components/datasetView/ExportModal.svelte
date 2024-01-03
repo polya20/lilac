@@ -3,6 +3,7 @@
   import {getDatasetViewContext} from '$lib/stores/datasetViewStore';
   import {getDisplayPath} from '$lib/view_utils';
   import {
+    DELETED_LABEL_KEY,
     childFields,
     isLabelField,
     isSignalField,
@@ -101,6 +102,12 @@
       excludeLabels[index] = false;
     } else {
       includeOnlyLabels[index] = false;
+    }
+  }
+
+  $: {
+    if (excludeLabels.length === 0) {
+      excludeLabels = labelFields.map(f => f.label === DELETED_LABEL_KEY);
     }
   }
 
